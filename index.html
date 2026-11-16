@@ -632,7 +632,7 @@ body.dark .badge.planned { background: #374151; color: #d1d5db; }
   'use strict';
   const PG = (globalThis.PG = globalThis.PG || {});
   PG.config = {
-    version: '1.1.0',
+    version: '1.2.0',
     subscriptionEnabled: false,   // OFF by default — nothing is gated
     premiumActivities: [],        // e.g. ['stories', 'reading'] when enabled
     dailyGoalCount: 3,            // insight · lesson · activity
@@ -1105,6 +1105,7 @@ body.dark .badge.planned { background: #374151; color: #d1d5db; }
         goals: {},          // '<lang>' -> { day, insight, lesson, activity }
         notifications: { seenDay: 0 },
         seenTmpl: {},       // '<lang>:<tplId>' -> count
+        langT: {},          // '<lang>' -> ms write clock: when that language's state last changed (per-language LWW sync)
         settings: { rate: 1, voice: null, captions: false, assist: false, romaji: true, dark: false, spokenResp: false, flashcards: false },
       };
     },
@@ -1280,6 +1281,65 @@ body.dark .badge.planned { background: #374151; color: #d1d5db; }
       profile.updatedAt = U.now();
       return JSON.stringify(profile);
     },
+
+    /* ---- per-language segmentation (sync v1.2) ----
+       Deterministically splits a profile into ONE segment per learning
+       language plus ONE global segment. The app diffs these segments on
+       every save to stamp per-language write clocks (langT), and sync
+       merges profiles language by language — last-write-wins PER
+       LANGUAGE, so a conflict never wipes either side's progress.
+       updatedAt/langT are bookkeeping and excluded from the segments. */
+    langSegments(profile) {
+      const langs = {};
+      const at = (l) => (langs[l] = langs[l] || { acts: null, goals: null, dims: null, items: null, seenTmpl: null, history: [] });
+      for (const k of ['acts', 'goals', 'dims']) {
+        const m = profile[k] || {};
+        for (const l in m) at(l)[k] = m[l];
+      }
+      /* items/seenTmpl are keyed '<lang>:<id>' — split by the first ':' */
+      for (const k of ['items', 'seenTmpl']) {
+        const m = profile[k] || {};
+        for (const key in m) {
+          const i = key.indexOf(':');
+          if (i <= 0) continue;
+          const s = at(key.slice(0, i));
+          s[k] = s[k] || {};
+          s[k][key] = m[key];
+        }
+      }
+      /* history entries carry their language in .lg */
+      (profile.history || []).forEach((h) => at((h && h.lg) || profile.target).history.push(h));
+      const out = {
+        langs: {},
+        global: JSON.stringify({
+          target: profile.target, native: profile.native, name: profile.name, avatar: profile.avatar,
+          xp: profile.xp, streak: profile.streak, lastDay: profile.lastDay,
+          notifications: profile.notifications, settings: profile.settings,
+        }),
+      };
+      for (const l in langs) out.langs[l] = JSON.stringify(langs[l]);
+      return out;
+    },
+
+    /* stamp write clocks after a save: every language whose segment
+       changed (vs. the baseline captured at the previous write or
+       adoption) gets langT[lang] = now; profile.updatedAt advances only
+       when anything changed at all. Returns the fresh baseline (plus
+       a changed flag) for the caller to cache. */
+    stampWriteClocks(profile, baseline, now) {
+      now = now == null ? U.now() : now;
+      const seg = this.langSegments(profile);
+      const base = baseline || { langs: {}, global: '' };
+      let changed = false;
+      profile.langT = profile.langT || {};
+      const langs = Object.assign({}, base.langs, seg.langs);
+      for (const l in langs) {
+        if (seg.langs[l] !== base.langs[l]) { profile.langT[l] = now; changed = true; }
+      }
+      if (seg.global !== base.global) changed = true;
+      if (changed) profile.updatedAt = now;
+      return { seg, changed };
+    },
     validateImport(obj) {
       if (!obj || typeof obj !== 'object') return 'not an object';
       if (obj.v !== 1 && obj.v !== 2 && obj.v !== 3) return 'unsupported version';
@@ -1320,6 +1380,11 @@ body.dark .badge.planned { background: #374151; color: #d1d5db; }
       obj.settings = Object.assign(base.settings, obj.settings || {});
       obj.notifications = Object.assign(base.notifications, obj.notifications || {});
       obj.seenTmpl = obj.seenTmpl || {};
+      /* per-language write clocks (sync v1.2): keep only sane numbers */
+      if (!obj.langT || typeof obj.langT !== 'object' || Array.isArray(obj.langT)) obj.langT = {};
+      else for (const k in obj.langT) {
+        if (typeof obj.langT[k] !== 'number' || !isFinite(obj.langT[k]) || obj.langT[k] < 0) delete obj.langT[k];
+      }
       obj.xp = typeof obj.xp === 'number' ? obj.xp : 0;
       obj.streak = typeof obj.streak === 'number' ? obj.streak : 0;
 
@@ -1807,16 +1872,21 @@ body.dark .badge.planned { background: #374151; color: #d1d5db; }
 /* ============================================================
    POLYGLOT AI — optional account sync (v1.2, Supabase)
    Cross-device progress sync. OPTIONAL by design:
-   - not configured → the app never makes a single network request
-   - signed out    → the app runs exactly as before (localStorage only)
-   - offline       → everything keeps working; changes queue locally
-                    and sync next time a sync succeeds
-   Storage model: the whole v3 per-language profile as ONE JSON row
-   per user in public.profiles, protected by Row Level Security
-   (each user can only read/write their own row). The client holds
-   ONLY the public anon key — never a service key.
-   Merge policy: last-write-wins. Each push stamps client_t = the
-   writer's clock; on conflict the later write wins as a whole.
+   - not signed in  → the app never makes a single network request
+   - signed out     → the app runs exactly as before (localStorage only)
+   - offline        → everything keeps working; changes queue locally
+                     and sync next time a sync succeeds
+   Storage model: the whole v3 profile as ONE JSON row per user in
+   public.profiles, protected by Row Level Security (each user can
+   only read/write their own row). The client holds ONLY the public
+   anon key — never a service key.
+   Merge policy: LAST-WRITE-WINS PER LANGUAGE. Every save stamps a
+   per-language write clock (profile.langT, see learner.stampWriteClocks);
+   when both a device and the cloud changed since the last sync, each
+   language is resolved independently by its clock — a language touched
+   only on one side always survives, so neither side is ever wiped.
+   Cumulative xp keeps the max; the streak follows the most recent
+   practice day; remaining globals resolve by the whole-profile clock.
    ============================================================ */
 (function () {
   'use strict';
@@ -1824,17 +1894,16 @@ body.dark .badge.planned { background: #374151; color: #d1d5db; }
   const U = PG.util;
 
   /* ============================================================
-     >>> PASTE YOUR SUPABASE PROJECT HERE (the ONLY place needed) <<<
-     Supabase Dashboard → Project → Settings → API:
-       - "Project URL"      → SUPABASE_URL
-       - "anon public" key  → SUPABASE_ANON_KEY
-     Run download/supabase-setup.sql in the SQL editor first.
-     NEVER paste the "service_role" key here — it bypasses RLS.
-     (You can also paste these at runtime in Settings → Sync —
-     then they live only in your browser's localStorage.)
+     Project credentials — anon (publishable) key ONLY, by design.
+     All row-level access control is enforced server-side by RLS
+     (see download/supabase-setup.sql). NEVER put a service_role key
+     in client code: it bypasses RLS completely.
+     Users may still override these at runtime (Settings → Account)
+     e.g. to point a test build at their own project; overrides live
+     only in the browser's localStorage.
      ============================================================ */
-  const SUPABASE_URL = '';        // e.g. 'https://abcd1234.supabase.co'
-  const SUPABASE_ANON_KEY = '';   // e.g. 'eyJhbGciOi...'
+  const SUPABASE_URL = 'https://qnyevovlhkzlzrkfckfd.supabase.co';
+  const SUPABASE_ANON_KEY = 'sb_publishable_2Cg-dGBMOrcy77uB2PsOfQ_AC7JjLQM';
 
   const K_CFG = 'pg.sync.cfg';
   const K_SESSION = 'pg.sync.session';
@@ -1935,15 +2004,103 @@ body.dark .badge.planned { background: #374151; color: #d1d5db; }
     },
 
     /* ============================================================
-       LAST-WRITE-WINS merge decision — pure, unit-tested.
+       PER-LANGUAGE LAST-WRITE-WINS merge — pure, unit-tested.
+       local / remote : v3 profiles (per-language state + globals)
+       Returns { profile: merged, remoteWon } — remoteWon=false means
+       local won every language and every global (nothing to adopt).
+       Rules (never wipes either side):
+         - a language present on only ONE side is kept, always
+         - both sides have the language → the later langT clock wins,
+           tie → local (stable, idempotent); the winning side's whole
+           segment (acts/goals/dims/items/seenTmpl/history) is taken
+         - xp is cumulative → max of both; streak/lastDay follow the
+           device that practiced most recently
+         - remaining globals (name, avatar, settings, target…) →
+           whole-profile clock (updatedAt), tie → local
+       ============================================================ */
+    mergeProfiles(local, remote) {
+      local = local || {};
+      remote = remote || {};
+      const out = JSON.parse(JSON.stringify(local));
+      const split = (p) => {
+        const seg = {};
+        const at = (l) => (seg[l] = seg[l] || { acts: null, goals: null, dims: null, items: null, seenTmpl: null, history: [] });
+        for (const k of ['acts', 'goals', 'dims']) {
+          const m = p[k] || {};
+          for (const l in m) at(l)[k] = m[l];
+        }
+        for (const k of ['items', 'seenTmpl']) {
+          const m = p[k] || {};
+          for (const key in m) {
+            const i = key.indexOf(':');
+            if (i <= 0) continue;
+            const s = at(key.slice(0, i));
+            s[k] = s[k] || {};
+            s[k][key] = m[key];
+          }
+        }
+        const fallback = p.target || local.target || 'es';
+        (p.history || []).forEach((h) => at((h && h.lg) || fallback).history.push(h));
+        return seg;
+      };
+      const L = split(local), R = split(remote);
+      const has = (s) => !!(s && (s.acts || s.goals || s.dims || s.items || s.seenTmpl || (s.history && s.history.length)));
+      const lt = local.langT || {}, rt = remote.langT || {};
+      out.acts = {}; out.goals = {}; out.dims = {};
+      out.items = {}; out.seenTmpl = {}; out.history = []; out.langT = {};
+      let remoteWon = false;
+      const langs = {};
+      Object.keys(L).forEach((l) => { langs[l] = 1; });
+      Object.keys(R).forEach((l) => { langs[l] = 1; });
+      for (const l of Object.keys(langs)) {
+        const hasL = has(L[l]), hasR = has(R[l]);
+        let take, fromRemote = false;
+        if (!hasR) take = L[l];
+        else if (!hasL) { take = R[l]; fromRemote = true; }
+        else if ((rt[l] || 0) > (lt[l] || 0)) { take = R[l]; fromRemote = true; }   /* true conflict: later clock wins */
+        else take = L[l];                                                          /* tie → local */
+        if (fromRemote) remoteWon = true;   /* remote contributed anything → adopt */
+        if (!take) continue;
+        if (take.acts) out.acts[l] = take.acts;
+        if (take.goals) out.goals[l] = take.goals;
+        if (take.dims) out.dims[l] = take.dims;
+        if (take.items) Object.assign(out.items, take.items);
+        if (take.seenTmpl) Object.assign(out.seenTmpl, take.seenTmpl);
+        out.history = out.history.concat(take.history || []);
+        out.langT[l] = Math.max(lt[l] || 0, rt[l] || 0);
+      }
+      out.history.sort((a, b) => (a.t || 0) - (b.t || 0));
+      if (out.history.length > 400) out.history = out.history.slice(out.history.length - 400);
+      /* globals: whole-profile clock, tie → local */
+      if ((remote.updatedAt || 0) > (local.updatedAt || 0)) {
+        remoteWon = true;
+        for (const k of ['target', 'native', 'name', 'avatar', 'notifications', 'settings']) {
+          if (remote[k] !== undefined) out[k] = remote[k];
+        }
+      }
+      /* cumulative progress never regresses */
+      out.xp = Math.max(local.xp || 0, remote.xp || 0);
+      if ((remote.lastDay || 0) > (local.lastDay || 0)) { out.streak = remote.streak || 0; out.lastDay = remote.lastDay; }
+      else { out.streak = local.streak || 0; out.lastDay = local.lastDay || 0; }
+      out.v = 3;
+      out.createdAt = Math.min(local.createdAt || Infinity, remote.createdAt || Infinity);
+      if (!isFinite(out.createdAt)) out.createdAt = local.createdAt || remote.createdAt || 0;
+      out.updatedAt = U.now();
+      return { profile: out, remoteWon };
+    },
+
+    /* ============================================================
+       Sync decision — pure, unit-tested.
        local      : the local profile (uses .updatedAt, ms)
        remote     : { data, client_t } | null  (client_t = writer clock, ms)
        lastSync   : ms timestamp of the last successful sync cycle (0 = never)
        opts       : { preferRemoteIfEmpty } — at SIGN-IN, restore a cloud
                     profile onto a device whose local profile is still empty
-       returns    : { action: 'push' | 'pull' | 'none', profile, reason }
-         push  → local is (or wins as) the newer write: send local
-         pull  → remote is the newer write: adopt remote.data wholesale
+       returns    : { action: 'push' | 'pull' | 'merge' | 'none', profile, reason }
+         push  → local is the only side that changed: send local
+         pull  → remote is the only side that changed: adopt remote.data
+         merge → BOTH sides changed since lastSync: resolve per language
+                 with mergeProfiles (never wipes either side)
          none  → already in sync, no network write needed
        Rules:
          - no remote row yet                      → push (first sync)
@@ -1951,8 +2108,7 @@ body.dark .badge.planned { background: #374151; color: #d1d5db; }
              local changed since lastSync         → push
              local unchanged                      → none
          - remote changed (client_t > lastSync):
-             local also changed (updatedAt > lastSync) → conflict →
-               later timestamp wins; tie → local (stable, idempotent)
+             local also changed (updatedAt > lastSync) → conflict → merge
              local unchanged                      → pull
        ============================================================ */
     decideSync(local, remote, lastSync, opts) {
@@ -1970,10 +2126,8 @@ body.dark .badge.planned { background: #374151; color: #d1d5db; }
       }
       /* remote changed since our last sync */
       if (lu > lastSync) {
-        /* both sides changed → last write wins (tie → local) */
-        return rt > lu
-          ? { action: 'pull', profile: remote.data, reason: 'conflict-remote-newer' }
-          : { action: 'push', profile: local, reason: 'conflict-local-newer' };
+        /* both sides changed → per-language merge, neither side wiped */
+        return { action: 'merge', profile: null, reason: 'conflict-merge' };
       }
       return { action: 'pull', profile: remote.data, reason: 'remote-changed' };
     },
@@ -2076,6 +2230,38 @@ body.dark .badge.planned { background: #374151; color: #d1d5db; }
       this._set('signedout');
     },
 
+    /* ---------- passwordless sign-in: a six-digit email code ----------
+       The "magic link without redirects": no Site-URL allowlist needed,
+       works from any static host. Supabase emails the code via the
+       Magic Link template (make sure it contains {{ .Token }}). */
+    async requestCode(email) {
+      email = String(email || '').trim();
+      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw new Error('invalid email');
+      await this._req('/auth/v1/otp', { method: 'POST', body: JSON.stringify({ email, create_user: true }) });
+      return {};
+    },
+
+    async verifyCode(email, code) {
+      email = String(email || '').trim();
+      code = String(code || '').trim();
+      if (!email || !/^\d{6}$/.test(code)) throw new Error('invalid code');
+      let j = null, lastErr = null;
+      /* GoTrue accepts the six-digit code under either type; try both */
+      for (const type of ['magiclink', 'email']) {
+        try {
+          j = await this._req('/auth/v1/verify', { method: 'POST', body: JSON.stringify({ type, token: code, email }) });
+          break;
+        } catch (e) {
+          lastErr = e;
+          if (!e || e.http !== 400) throw e;
+        }
+      }
+      if (!j || !j.access_token) throw new Error('invalid code');
+      this._saveSession({ access_token: j.access_token, refresh_token: j.refresh_token, expires_at: j.expires_at || 0, user: j.user || { id: null, email } });
+      this._set('syncing');
+      return {};
+    },
+
     async _getRow() {
       const ses = this.session();
       if (!ses || !ses.user || !ses.user.id) return null;
@@ -2122,11 +2308,22 @@ body.dark .badge.planned { background: #374151; color: #d1d5db; }
         }
         const d = this.decideSync(local, remote, st.lastSync, opts);
         if (d.action === 'pull') {
-          /* remote wins: adopt wholesale, through the validating
-             deserializer (migration + schema guard, never trust a row) */
+          /* remote is the only side that changed: adopt wholesale, through
+             the validating deserializer (migration + schema guard) */
           const res = PG.learner.deserialize(JSON.stringify(d.profile));
           if (!res.profile) throw new Error('remote profile rejected');
           deps.adoptProfile(res.profile);
+        } else if (d.action === 'merge') {
+          /* both sides changed: resolve PER LANGUAGE — never wipe either */
+          const m = this.mergeProfiles(local, remote.data);
+          let pushProfile = local;
+          if (m.remoteWon) {
+            const res = PG.learner.deserialize(JSON.stringify(m.profile));
+            if (!res.profile) throw new Error('merged profile rejected');
+            deps.adoptProfile(res.profile);
+            pushProfile = res.profile;
+          }
+          await this._upsert(pushProfile, U.now());
         } else if (d.action === 'push') {
           await this._upsert(d.profile, U.now());
         }
@@ -2136,7 +2333,9 @@ body.dark .badge.planned { background: #374151; color: #d1d5db; }
         return { ok: true, action: d.action, reason: d.reason };
       } catch (e) {
         const msg = String((e && e.message) || e);
-        this._set(/credential|rejected|not signed/.test(msg) ? 'error' : 'offline', msg);
+        /* network unreachable → offline chip; any server-side failure
+           (5xx, rejected profile, auth) → error chip */
+        this._set(/network unreachable/.test(msg) ? 'offline' : 'error', msg);
         return { ok: false, error: msg };
       }
     },
@@ -5594,6 +5793,98 @@ body.dark .badge.planned { background: #374151; color: #d1d5db; }
     'sync.err.credentials': 'Email o password errati.',
     'sync.err.network': 'Server irraggiungibile — le modifiche restano su questo dispositivo.',
   });
+
+  /* v1.2 passwordless sign-in (six-digit email code) — same keys in every locale */
+  R('en', {
+    'sync.useCode': 'Email me a sign-in code',
+    'sync.codeSent': 'Code sent — check your inbox (and spam folder).',
+    'sync.codeLabel': 'Sign-in code (6 digits)',
+    'sync.verify': 'Verify and sign in',
+    'sync.resend': 'Send the code again',
+    'sync.backToPassword': 'Use password instead',
+    'sync.err.code': 'That code is invalid or expired.',
+  });
+  R('zh', {
+    'sync.useCode': '向我的邮箱发送登录验证码',
+    'sync.codeSent': '验证码已发送——请查收邮箱（及垃圾邮件）。',
+    'sync.codeLabel': '登录验证码（6 位数字）',
+    'sync.verify': '验证并登录',
+    'sync.resend': '重新发送验证码',
+    'sync.backToPassword': '改用密码登录',
+    'sync.err.code': '验证码无效或已过期。',
+  });
+  R('es', {
+    'sync.useCode': 'Enviarme un código por correo',
+    'sync.codeSent': 'Código enviado — revisa tu bandeja (y el spam).',
+    'sync.codeLabel': 'Código de acceso (6 dígitos)',
+    'sync.verify': 'Verificar e iniciar sesión',
+    'sync.resend': 'Enviar el código de nuevo',
+    'sync.backToPassword': 'Usar contraseña',
+    'sync.err.code': 'El código no es válido o ha caducado.',
+  });
+  R('fr', {
+    'sync.useCode': 'Recevoir un code par e-mail',
+    'sync.codeSent': 'Code envoyé — vérifiez votre boîte (et les indésirables).',
+    'sync.codeLabel': 'Code de connexion (6 chiffres)',
+    'sync.verify': 'Vérifier et se connecter',
+    'sync.resend': 'Renvoyer le code',
+    'sync.backToPassword': 'Utiliser le mot de passe',
+    'sync.err.code': 'Code invalide ou expiré.',
+  });
+  R('de', {
+    'sync.useCode': 'Sende mir einen Code per E-Mail',
+    'sync.codeSent': 'Code gesendet — prüfe dein Postfach (und den Spamordner).',
+    'sync.codeLabel': 'Anmelde-Code (6 Ziffern)',
+    'sync.verify': 'Bestätigen und anmelden',
+    'sync.resend': 'Code erneut senden',
+    'sync.backToPassword': 'Stattdessen Passwort benutzen',
+    'sync.err.code': 'Der Code ist ungültig oder abgelaufen.',
+  });
+  R('ja', {
+    'sync.useCode': 'メールでサインインコードを送信',
+    'sync.codeSent': 'コードを送信しました。受信箱（迷惑メール箱も）を確認してください。',
+    'sync.codeLabel': 'サインインコード（6桁）',
+    'sync.verify': '確認してログイン',
+    'sync.resend': 'コードを再送信',
+    'sync.backToPassword': 'パスワードを使う',
+    'sync.err.code': 'コードが無効か期限切れです。',
+  });
+  R('pt', {
+    'sync.useCode': 'Enviar um código por e-mail',
+    'sync.codeSent': 'Código enviado — veja sua caixa de entrada (e o spam).',
+    'sync.codeLabel': 'Código de acesso (6 dígitos)',
+    'sync.verify': 'Verificar e entrar',
+    'sync.resend': 'Enviar o código novamente',
+    'sync.backToPassword': 'Usar senha',
+    'sync.err.code': 'Código inválido ou expirado.',
+  });
+  R('ru', {
+    'sync.useCode': 'Прислать код по почте',
+    'sync.codeSent': 'Код отправлен — проверьте почту (и спам).',
+    'sync.codeLabel': 'Код входа (6 цифр)',
+    'sync.verify': 'Подтвердить и войти',
+    'sync.resend': 'Отправить код ещё раз',
+    'sync.backToPassword': 'Войти по паролю',
+    'sync.err.code': 'Код недействителен или истёк.',
+  });
+  R('ar', {
+    'sync.useCode': 'أرسل لي رمز دخول بالبريد',
+    'sync.codeSent': 'تم إرسال الرمز — تحقّق من بريدك (ومجلّد الرسائل غير المرغوبة).',
+    'sync.codeLabel': 'رمز الدخول (6 أرقام)',
+    'sync.verify': 'تحقّق وسجّل الدخول',
+    'sync.resend': 'إعادة إرسال الرمز',
+    'sync.backToPassword': 'استخدام كلمة المرور',
+    'sync.err.code': 'الرمز غير صالح أو منتهي.',
+  });
+  R('it', {
+    'sync.useCode': 'Inviami un codice via email',
+    'sync.codeSent': 'Codice inviato — controlla la posta (e lo spam).',
+    'sync.codeLabel': 'Codice di accesso (6 cifre)',
+    'sync.verify': 'Verifica e accedi',
+    'sync.resend': 'Invia di nuovo il codice',
+    'sync.backToPassword': 'Usa la password',
+    'sync.err.code': 'Codice non valido o scaduto.',
+  });
 })();
 
 /* ==== content/lang/ar.js ==== */
@@ -7389,6 +7680,10 @@ body.dark .badge.planned { background: #374151; color: #d1d5db; }
       if (this.profile) { this.applyLang(); this.go('home', null, { root: true }); }
       else this.go('onboarding', null, { root: true });
 
+      /* baseline for per-language write clocks: the next save() diffs
+         against this to stamp profile.langT (per-language LWW sync) */
+      this._segBase = this.profile ? PG.learner.langSegments(this.profile) : null;
+
       PG.providers.tts.onVoices(() => this.checkVoices());
       setTimeout(() => this.checkVoices(), 1200);
 
@@ -7413,6 +7708,9 @@ body.dark .badge.planned { background: #374151; color: #d1d5db; }
            remote's updatedAt (the winning write's clock), rerender */
         adoptProfile: (p) => {
           this.profile = p;
+          /* adopted state IS the new baseline — never re-stamp it as a
+             local write, or adopted languages would wrongly win ties */
+          this._segBase = PG.learner.langSegments(p);
           U.store.set(STORE_KEY, p);
           this.applyLang();
           if (this.route) this.go(this.route.name, this.route.params, { root: true });
@@ -7550,7 +7848,11 @@ body.dark .badge.planned { background: #374151; color: #d1d5db; }
       if (!this.profile) return;
       clearTimeout(this._saveT);
       this._saveT = setTimeout(() => {
-        this.profile.updatedAt = U.now();   /* local-write clock for LWW sync */
+        /* stamp per-language write clocks: only languages whose segment
+           actually changed get langT = now, so a later conflict merge can
+           resolve each language independently (never wipes either side) */
+        const r = PG.learner.stampWriteClocks(this.profile, this._segBase);
+        this._segBase = r.seg;
         U.store.set(STORE_KEY, this.profile);
         if (PG.sync) PG.sync.autoSync(this._syncDeps());
       }, 250);
@@ -9175,6 +9477,11 @@ body.dark .badge.planned { background: #374151; color: #d1d5db; }
     { code: 'ru', name: 'Русский' }, { code: 'ar', name: 'العربية' }, { code: 'zh', name: '中文' }, { code: 'ja', name: '日本語' },
   ];
 
+  /* sign-in mode for the account panel — module scope so it survives
+     the settings screen re-rendering after "send me a code" */
+  let syncMode = 'password';   /* 'password' | 'code' (six-digit email code) */
+  let syncEmail = '';          /* carried across re-renders so switching modes never loses it */
+
   function langSheet(profile) {
     const pack = app.targetPack();
     const statusText = pack.status === 'verified' ? T('you.verifiedLong') : T('you.draftLong');
@@ -9313,31 +9620,44 @@ body.dark .badge.planned { background: #374151; color: #d1d5db; }
         '<input type="checkbox" id="' + id + '"' + (on ? ' checked' : '') + '><span class="t-switch" aria-hidden="true"></span></label>';
     }
 
-    /* ---- optional account sync (v1.2): three states ---- */
-    function syncSection() {
-      if (!PG.sync) return '';
-      const info = PG.sync.info();
-      if (!info.configured) {
-        return '<section class="panel" id="sync-panel"><h3>☁️ ' + U.esc(T('sync.title')) + '</h3>' +
-          '<p class="panel-note">' + U.esc(T('sync.hint')) + '</p>' +
-          '<label class="field"><span>' + U.esc(T('sync.cfgUrl')) + '</span>' +
-          '<input type="url" id="sync-url" placeholder="https://xxxx.supabase.co" spellcheck="false"></label>' +
-          '<label class="field"><span>' + U.esc(T('sync.cfgKey')) + '</span>' +
-          '<input type="text" id="sync-key" autocomplete="off" spellcheck="false"></label>' +
-          '<div class="onb-actions"><button class="btn ghost" id="sync-connect">' + U.esc(T('sync.cfgConnect')) + '</button></div>' +
-          '<p class="panel-note">' + U.esc(T('sync.cfgHint')) + '</p></section>';
-      }
-      if (!info.email) {
+  /* ---- optional account sync (v1.2): three states, two sign-in modes ---- */
+  function syncSection() {
+    if (!PG.sync) return '';
+    const info = PG.sync.info();
+    if (!info.configured) {
+      return '<section class="panel" id="sync-panel"><h3>☁️ ' + U.esc(T('sync.title')) + '</h3>' +
+        '<p class="panel-note">' + U.esc(T('sync.hint')) + '</p>' +
+        '<label class="field"><span>' + U.esc(T('sync.cfgUrl')) + '</span>' +
+        '<input type="url" id="sync-url" placeholder="https://xxxx.supabase.co" spellcheck="false"></label>' +
+        '<label class="field"><span>' + U.esc(T('sync.cfgKey')) + '</span>' +
+        '<input type="text" id="sync-key" autocomplete="off" spellcheck="false"></label>' +
+        '<div class="onb-actions"><button class="btn ghost" id="sync-connect">' + U.esc(T('sync.cfgConnect')) + '</button></div>' +
+        '<p class="panel-note">' + U.esc(T('sync.cfgHint')) + '</p></section>';
+    }
+    if (!info.email) {
+      if (syncMode === 'code') {
         return '<section class="panel" id="sync-panel"><h3>☁️ ' + U.esc(T('sync.title')) + '</h3>' +
           '<p class="panel-note">' + U.esc(T('sync.hint')) + '</p>' +
           '<label class="field"><span>' + U.esc(T('sync.email')) + '</span>' +
           '<input type="email" id="sync-email" autocomplete="username"></label>' +
-          '<label class="field"><span>' + U.esc(T('sync.password')) + '</span>' +
-          '<input type="password" id="sync-pass" autocomplete="current-password"></label>' +
-          '<div class="onb-actions"><button class="btn" id="sync-signin">' + U.esc(T('sync.signIn')) + '</button>' +
-          '<button class="btn ghost" id="sync-signup">' + U.esc(T('sync.signUp')) + '</button></div>' +
+          '<label class="field"><span>' + U.esc(T('sync.codeLabel')) + '</span>' +
+          '<input type="text" id="sync-code" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="······" spellcheck="false"></label>' +
+          '<div class="onb-actions"><button class="btn" id="sync-verify">' + U.esc(T('sync.verify')) + '</button>' +
+          '<button class="btn ghost" id="sync-resend">📧 ' + U.esc(T('sync.resend')) + '</button></div>' +
+          '<div class="onb-actions"><button class="btn ghost" id="sync-backpw">' + U.esc(T('sync.backToPassword')) + '</button></div>' +
           '<p class="panel-note" id="sync-msg"></p></section>';
       }
+      return '<section class="panel" id="sync-panel"><h3>☁️ ' + U.esc(T('sync.title')) + '</h3>' +
+        '<p class="panel-note">' + U.esc(T('sync.hint')) + '</p>' +
+        '<label class="field"><span>' + U.esc(T('sync.email')) + '</span>' +
+        '<input type="email" id="sync-email" autocomplete="username"></label>' +
+        '<label class="field"><span>' + U.esc(T('sync.password')) + '</span>' +
+        '<input type="password" id="sync-pass" autocomplete="current-password"></label>' +
+        '<div class="onb-actions"><button class="btn" id="sync-signin">' + U.esc(T('sync.signIn')) + '</button>' +
+        '<button class="btn ghost" id="sync-signup">' + U.esc(T('sync.signUp')) + '</button></div>' +
+        '<div class="onb-actions"><button class="btn ghost" id="sync-code-btn">📧 ' + U.esc(T('sync.useCode')) + '</button></div>' +
+        '<p class="panel-note" id="sync-msg"></p></section>';
+    }
       return '<section class="panel" id="sync-panel"><h3>☁️ ' + U.esc(T('sync.title')) + '</h3>' +
         '<p class="panel-note"><b>' + U.esc(T('sync.signedInAs', { email: info.email })) + '</b></p>' +
         '<p class="panel-note"><span class="sync-chip static" data-sync-chip hidden></span></p>' +
@@ -9350,16 +9670,54 @@ body.dark .badge.planned { background: #374151; color: #d1d5db; }
       if (!PG.sync) return;
       const q = (id) => UI.qs('#' + id, view);
       const msg = q('sync-msg');
+      /* re-render after "send me a code" rebuilds the form: restore the
+         email the user already typed (never make them type it twice) */
+      const em = q('sync-email');
+      if (em && !em.value && syncEmail) em.value = syncEmail;
+      if (em && em.value) syncEmail = em.value;
       const fail = (e) => {
         const m = String((e && e.message) || e);
-        if (msg) msg.textContent = /credential|password|email/i.test(m) && /invalid|wrong|bad|weak/i.test(m)
-          ? T('sync.err.credentials') : (/network|unreachable/i.test(m) ? T('sync.err.network') : m);
+        if (msg) msg.textContent =
+          /invalid code/.test(m) ? T('sync.err.code') :
+          /credential|password|email/i.test(m) && /invalid|wrong|bad|weak/i.test(m) ? T('sync.err.credentials') :
+          (/network|unreachable/i.test(m) ? T('sync.err.network') : m);
       };
       const connect = q('sync-connect');
       if (connect) connect.addEventListener('click', () => {
         try { PG.sync.setConfig(q('sync-url').value, q('sync-key').value); app.go('settings'); }
         catch (e) { fail(e); }
       });
+      /* passwordless: send a six-digit code to the email typed above,
+         then verify it — no redirect/Site-URL setup needed */
+      const codeBtn = q('sync-code-btn');
+      if (codeBtn) codeBtn.addEventListener('click', () => {
+        syncEmail = q('sync-email').value;
+        PG.sync.requestCode(syncEmail)
+          .then(() => { syncMode = 'code'; app.go('settings'); })
+          .catch(fail);
+      });
+      const verifyBtn = q('sync-verify');
+      if (verifyBtn) {
+        if (msg) msg.textContent = T('sync.codeSent');
+        verifyBtn.addEventListener('click', () => {
+          PG.sync.verifyCode(q('sync-email').value, q('sync-code').value)
+            .then((r) => {
+              if (r && r.needsConfirmation) { if (msg) msg.textContent = T('sync.confirmEmail'); return; }
+              syncMode = 'password';
+              return PG.sync.syncNow(app._syncDeps(), { preferRemoteIfEmpty: true })
+                .then(() => { app.go('settings'); });
+            })
+            .catch(fail);
+        });
+      }
+      const resendBtn = q('sync-resend');
+      if (resendBtn) resendBtn.addEventListener('click', () => {
+        PG.sync.requestCode(q('sync-email').value)
+          .then(() => { if (msg) msg.textContent = T('sync.codeSent'); })
+          .catch(fail);
+      });
+      const backPw = q('sync-backpw');
+      if (backPw) backPw.addEventListener('click', () => { syncMode = 'password'; app.go('settings'); });
       const doAuth = (fn) => {
         fn(q('sync-email').value, q('sync-pass').value)
           .then((r) => {
@@ -9492,6 +9850,7 @@ body.dark .badge.planned { background: #374151; color: #d1d5db; }
         const res = PG.learner.deserialize(String(r.result));
         if (res.error) { UI.toast(T('onb.importFail')); return; }
         app.profile = res.profile;
+        app._segBase = PG.learner.langSegments(res.profile);   /* imported state = new baseline, keeps its own write clocks */
         app.applyLang();
         app.save();
         app.go('settings');
@@ -9513,6 +9872,7 @@ body.dark .badge.planned { background: #374151; color: #d1d5db; }
             if (PG.sync && PG.sync.session()) PG.sync.signOut().catch(() => {});
             U.store.remove('polyglot-ai-v1');
             app.profile = null;
+            app._segBase = null;
             app.closeSheet();
             app.go('onboarding', null, { root: true });
           });
