@@ -632,7 +632,7 @@ body.dark .badge.planned { background: #374151; color: #d1d5db; }
   'use strict';
   const PG = (globalThis.PG = globalThis.PG || {});
   PG.config = {
-    version: '1.2.0',
+    version: '1.2.1',
     subscriptionEnabled: false,   // OFF by default — nothing is gated
     premiumActivities: [],        // e.g. ['stories', 'reading'] when enabled
     dailyGoalCount: 3,            // insight · lesson · activity
@@ -2135,13 +2135,28 @@ body.dark .badge.planned { background: #374151; color: #d1d5db; }
     /* ---------- Supabase REST (documented API, no SDK needed) ---------- */
     _fetchGuard() { return typeof globalThis.fetch === 'function'; },
 
+    /* short request label for error messages, so a screenshot of the
+       sync chip says WHICH request failed ("profiles GET 404: …") */
+    _label(path) {
+      const p = String(path || '').split('?')[0];
+      if (p.indexOf('/rest/v1/') === 0) return p.slice('/rest/v1/'.length) || 'api';
+      if (p.indexOf('/auth/v1/') === 0) {
+        const a = p.slice('/auth/v1/'.length);
+        return a === 'token' ? 'sign-in' : a === 'signup' ? 'sign-up'
+          : (a === 'otp' || a === 'verify') ? 'email code' : a === 'logout' ? 'sign-out' : 'auth ' + a;
+      }
+      return p;
+    },
+
     /* NOTE on network policy: the app's CSP (shell.html) allows fetch
        ONLY to *.supabase.co / *.supabase.com (and localhost for dev).
        With sync unconfigured the client makes no request at all. */
     async _req(path, opts, tryRefresh) {
       if (!this._fetchGuard()) throw new Error('network unavailable');
       const c = this._config();
-      const h = Object.assign({ apikey: c.anonKey }, opts.headers || {});
+      const label = this._label(path);
+      const method = opts.method || 'GET';
+      const h = Object.assign({ apikey: c.anonKey, Accept: 'application/json' }, opts.headers || {});
       const ses = this.session();
       if (ses) h.Authorization = 'Bearer ' + ses.access_token;
       if (opts.body) h['Content-Type'] = 'application/json';
@@ -2149,7 +2164,7 @@ body.dark .badge.planned { background: #374151; color: #d1d5db; }
       const timer = ctl ? setTimeout(() => { try { ctl.abort(); } catch (e) {} }, 15000) : null;
       let res;
       try {
-        res = await fetch(c.url + path, { method: opts.method || 'GET', headers: h, body: opts.body || null, signal: ctl ? ctl.signal : undefined });
+        res = await fetch(c.url + path, { method, headers: h, body: opts.body || null, signal: ctl ? ctl.signal : undefined });
       } catch (e) {
         throw new Error('network unreachable');
       } finally {
@@ -2159,17 +2174,33 @@ body.dark .badge.planned { background: #374151; color: #d1d5db; }
         const ok = await this._refresh();
         if (ok) return this._req(path, opts, false);
       }
-      if (!res.ok) {
-        let msg = 'HTTP ' + res.status;
-        try {
-          const j = await res.json();
-          msg = j.msg || j.message || (j.error && j.error.message) || j.error_description || msg;
-        } catch (e) {}
-        if (res.status === 400 && /credential/i.test(msg)) throw new Error('bad credentials');
-        const e = new Error(msg); e.http = res.status; throw e;
-      }
       if (res.status === 204 || res.status === 205) return null;
-      return res.json();
+      /* Read the body ONCE as text and parse it ourselves. Never call
+         res.json() directly: on WebKit/Safari it rejects with a bare
+         SyntaxError — "The string did not match the expected pattern."
+         — for ANY body that is not JSON (an HTML error page from an
+         intermediary, an empty or truncated body), which surfaced as
+         an undiagnosable "Sync problem" chip on real iPhones. Parsing
+         here lets the error name the request, the HTTP status and a
+         snippet of what actually came back. */
+      let text = '';
+      try { text = await res.text(); } catch (e) { /* unreadable body: fall through */ }
+      let j, parsed = false;
+      if (text) {
+        try { j = JSON.parse(text); parsed = true; } catch (e) { /* not JSON */ }
+      }
+      if (!res.ok) {
+        const detail = (j && (j.msg || j.message || (j.error && j.error.message) || j.error_description)) || ('HTTP ' + res.status);
+        if (res.status === 400 && /credential/i.test(detail)) throw new Error('bad credentials');
+        const e = new Error(label + ' ' + method + ' ' + res.status + ': ' + detail);
+        e.http = res.status;
+        throw e;
+      }
+      if (text && !parsed) {
+        const snip = text.slice(0, 60).replace(/\s+/g, ' ') + (text.length > 60 ? '…' : '');
+        throw new Error(label + ' ' + method + ' ' + res.status + ': response was not JSON — "' + snip + '"');
+      }
+      return parsed ? j : null;
     },
 
     async _refresh() {
@@ -2179,11 +2210,12 @@ body.dark .badge.planned { background: #374151; color: #d1d5db; }
       try {
         const res = await fetch(c.url + '/auth/v1/token?grant_type=refresh_token', {
           method: 'POST',
-          headers: { apikey: c.anonKey, 'Content-Type': 'application/json' },
+          headers: { apikey: c.anonKey, Accept: 'application/json', 'Content-Type': 'application/json' },
           body: JSON.stringify({ refresh_token: ses.refresh_token }),
         });
         if (!res.ok) return false;
-        const j = await res.json();
+        let j = null;
+        try { j = await res.json(); } catch (e) { return false; }
         if (!j || !j.access_token) return false;
         this._saveSession({ access_token: j.access_token, refresh_token: j.refresh_token || ses.refresh_token, expires_at: j.expires_at || 0, user: j.user || ses.user });
         return true;
@@ -2212,8 +2244,10 @@ body.dark .badge.planned { background: #374151; color: #d1d5db; }
       try {
         j = await this._req('/auth/v1/token?grant_type=password', { method: 'POST', body: JSON.stringify({ email, password }) });
       } catch (e) {
-        /* GoTrue answers 400 for wrong email/password — surface it cleanly */
-        if (e && e.http === 400) throw new Error('bad credentials');
+        /* GoTrue answers 400 for wrong email/password — surface it cleanly.
+           "Email not confirmed" is also a 400: it must NOT read as a wrong
+           password (this project requires email confirmation). */
+        if (e && e.http === 400) throw new Error(/confirm/i.test(String(e.message)) ? 'email not confirmed' : 'bad credentials');
         throw e;
       }
       if (!j || !j.access_token) throw new Error('bad credentials');
@@ -7732,10 +7766,16 @@ body.dark .badge.planned { background: #374151; color: #d1d5db; }
         if (!info.configured || !info.email || !m) { el.hidden = true; return; }
         el.hidden = false;
         el.className = 'sync-chip ' + m.cls;
-        el.innerHTML = m.icon + ' ' + U.esc(PG.i18n.T(m.key)) +
-          (info.status === 'synced' && info.lastSync
-            ? ' <span class="sync-t">' + new Date(info.lastSync).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '</span>'
-            : '');
+        /* error chips carry the short technical reason (request + HTTP
+           status) so a screenshot is enough to diagnose the failure */
+        let extra = '';
+        if (info.status === 'synced' && info.lastSync) {
+          extra = ' <span class="sync-t">' + new Date(info.lastSync).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '</span>';
+        } else if (info.status === 'error' && info.message) {
+          const t = info.message.length > 70 ? info.message.slice(0, 70) + '…' : info.message;
+          extra = ' <span class="sync-t">' + U.esc(t) + '</span>';
+        }
+        el.innerHTML = m.icon + ' ' + U.esc(PG.i18n.T(m.key)) + extra;
       });
     },
 
